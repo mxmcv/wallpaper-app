@@ -1,5 +1,5 @@
 GITHUB_BASE_URL = (
-    "https://raw.githubusercontent.com/YOUR_USERNAME/magic-app/main/images/cards/"
+    "https://raw.githubusercontent.com/mxmcv/wallpaper-app/core/images/cards/"
 )
 
 RANKS = ["ace", "2", "3", "4", "5", "6", "7", "8", "9", "10", "jack", "queen", "king"]
