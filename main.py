@@ -1,13 +1,21 @@
+# main.py
+from __future__ import annotations
+
 import os
+import re
 import tempfile
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from groq import Groq
-from cards import get_card_url
+
+from cards import (
+    extract_card_from_transcript,
+    get_card_url,
+    normalize_card_code,
+)
 
 app = FastAPI(title="Magic Card Reveal API")
 
-# --- CORS Middleware ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,76 +23,126 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- SYSTEM PROMPT ---
+CARD_BACK_URL = "https://raw.githubusercontent.com/mxmcv/wallpaper-app/core/images/cards/back.jpg"
+
+# --- System prompt tuned for "messy convo" + strict output ---
 SYSTEM_PROMPT = (
-    "You are a card identifier. The user is naming a playing card.\n"
-    "Your job is to convert their speech into a standardized filename format: '{rank}_{suit}'.\n"
+    "You are a card-extraction engine for a magic trick.\n"
+    "Input will be a messy conversation transcript (banter, filler words, etc.) that includes a named playing card.\n"
+    "Your job is to output the final chosen/settled playing card.\n\n"
+    "OUTPUT FORMAT (STRICT): rank_suit\n"
+    "Valid ranks: ace,2,3,4,5,6,7,8,9,10,jack,queen,king\n"
+    "Valid suits: clubs,diamonds,hearts,spades\n"
+    "Examples:\n"
+    "Input: 'maybe the three... wait no the two of hearts' -> 2_hearts\n"
+    "Input: 'bro it's obviously the two of hearts' -> 2_hearts\n"
+    "Input: 'final answer: ace of spades' -> ace_spades\n\n"
     "Rules:\n"
-    "1. Ranks: ace, 2, 3, 4, 5, 6, 7, 8, 9, 10, jack, queen, king.\n"
-    "2. Suits: clubs, diamonds, hearts, spades.\n"
-    "3. Output: Return ONLY the formatted string (e.g., '7_diamonds', 'queen_hearts', 'ace_spades').\n"
-    "4. If the user says 'Joker', return 'joker'.\n"
-    "5. If no card is mentioned, return 'error'.\n"
-    "6. Do not output markdown or explanation."
+    "- Output ONLY the code. No extra text.\n"
+    "- If no card can be confidently identified, output: error\n"
 )
 
-# --- HELPER: Lazy Load Client ---
-def get_groq_client():
-    """Safely initializes the Groq client only when needed."""
+# Bias Whisper toward hearing card vocabulary
+WHISPER_BIAS_VOCAB = (
+    "ace, two, three, four, five, six, seven, eight, nine, ten, "
+    "jack, queen, king, clubs, diamonds, hearts, spades, "
+    "2,3,4,5,6,7,8,9,10"
+)
+
+
+def get_groq_client() -> Groq:
     api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
-        print("CRITICAL ERROR: GROQ_API_KEY is missing from environment.")
-        raise HTTPException(status_code=500, detail="Server configuration error: API Key missing.")
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY missing.")
     return Groq(api_key=api_key)
 
 
-# --- HELPER: Transcribe Audio ---
 def _transcribe(audio_path: str) -> str:
-    """Send an audio file to Groq Whisper and return the transcript."""
     client = get_groq_client()
-    
     try:
         with open(audio_path, "rb") as f:
             transcription = client.audio.transcriptions.create(
                 file=(os.path.basename(audio_path), f.read()),
                 model="whisper-large-v3",
+                prompt=WHISPER_BIAS_VOCAB,
                 response_format="text",
+                language="en",
             )
-        return str(transcription).strip()
+        transcript = str(transcription).strip()
+        print(f"[whisper] transcript: {transcript}")
+        return transcript
     except Exception as e:
-        print(f"Transcription Error: {e}")
-        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+        print(f"[whisper] error: {e}")
+        return ""
 
 
-# --- HELPER: Extract Card Code ---
-def _extract_card_code(transcript: str) -> str:
-    """Ask Llama 3 to normalize a transcript into a card code."""
+def _llm_extract_card_code(transcript: str) -> str:
+    """
+    LLM extraction is a *fallback*. We still validate and normalize after.
+    """
+    if not transcript:
+        return "error"
+
     client = get_groq_client()
-
     try:
         chat = client.chat.completions.create(
-            # --- FIX: UPDATED MODEL ID HERE ---
             model="llama-3.1-8b-instant",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": transcript},
             ],
             temperature=0,
-            max_tokens=30,
         )
-        return (chat.choices[0].message.content or "error").strip().lower()
+
+        raw = (chat.choices[0].message.content or "").strip().lower()
+        print(f"[llm] raw: {raw}")
+
+        # Hard-trim to first token line, just in case
+        raw = raw.splitlines()[0].strip()
+
+        # Must be either 'error' or a plausible rank_suit pattern
+        if raw == "error":
+            return "error"
+
+        # very strict regex to avoid extra words
+        if not re.fullmatch(r"(ace|[2-9]|10|jack|queen|king)_(clubs|diamonds|hearts|spades)", raw):
+            return "error"
+
+        return raw
     except Exception as e:
-        print(f"LLM Error: {e}")
+        print(f"[llm] error: {e}")
         return "error"
 
 
-# --- ENDPOINT: Reveal Card ---
+def _best_card_code(transcript: str) -> str:
+    """
+    1) Deterministic transcript scan (best when Whisper is okay)
+    2) LLM extraction fallback
+    3) Final normalization/validation (never reveal wrong card)
+    """
+    # Pass 1: deterministic scan from transcript
+    code1 = extract_card_from_transcript(transcript)
+    if code1:
+        return code1
+
+    # Pass 2: LLM fallback
+    code2 = _llm_extract_card_code(transcript)
+    if code2 != "error":
+        # normalize_card_code also rejects invalid values
+        normalized = normalize_card_code(code2)
+        if normalized:
+            return normalized
+
+    # Pass 3: last-ditch deterministic normalize on full transcript
+    code3 = normalize_card_code(transcript)
+    if code3:
+        return code3
+
+    return "error"
+
+
 @app.post("/card-reveal")
 async def card_reveal(file: UploadFile = File(...)):
-    """Accept a multipart audio file and return the matching card image URL."""
-    if file.content_type and not file.content_type.startswith("audio/"):
-        raise HTTPException(status_code=400, detail="Upload must be an audio file.")
-
     suffix = os.path.splitext(file.filename or "audio.m4a")[1] or ".m4a"
     tmp_path = None
 
@@ -94,26 +152,22 @@ async def card_reveal(file: UploadFile = File(...)):
             tmp_path = tmp.name
 
         transcript = _transcribe(tmp_path)
-        card_code = _extract_card_code(transcript)
-        
+
+        card_code = _best_card_code(transcript)
         url, matched = get_card_url(card_code)
 
-        return {
-            "url": url,
-            "card": card_code if matched else "back",
-            "transcript": transcript,
-        }
+        if not matched or card_code == "error":
+            print("[result] no confident card found -> showing back")
+            return {"url": CARD_BACK_URL, "card": "back", "transcript": transcript}
 
-    except Exception as e:
-        print(f"Processing Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-        
+        print(f"[result] matched: {card_code}")
+        return {"url": url, "card": card_code, "transcript": transcript}
+
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
 
-# --- ENDPOINT: Health Check ---
 @app.get("/")
 async def health():
-    return {"status": "ok", "service": "magic-card-reveal"}
+    return {"status": "ok"}
